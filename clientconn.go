@@ -937,6 +937,7 @@ func (cc *ClientConn) newAddrConnLocked(addrs []resolver.Address, opts balancer.
 		dopts:        cc.dopts,
 		channelz:     channelz.RegisterSubChannel(cc.channelz, ""),
 		resetBackoff: make(chan struct{}),
+		stateCh:      make(chan struct{}),
 	}
 	ac.updateTelemetryLabelsLocked()
 	ac.ctx, ac.cancel = context.WithCancel(cc.ctx)
@@ -1295,6 +1296,12 @@ type addrConn struct {
 	// Use updateConnectivityState for updating addrConn's connectivity state.
 	state connectivity.State
 
+	// stateCh is closed and replaced with a fresh channel every time the
+	// addrConn transitions to a new connectivity state. RPCs pinned to this
+	// subchannel select on it while waiting for the subchannel to become
+	// READY again; it must never be closed directly. Guarded by mu.
+	stateCh chan struct{}
+
 	backoffIdx   int // Needs to be stateful for resetConnectBackoff.
 	resetBackoff chan struct{}
 
@@ -1335,6 +1342,10 @@ func (ac *addrConn) updateConnectivityState(s connectivity.State, lastErr error)
 		channelz.Infof(logger, ac.channelz, "Subchannel Connectivity change to %v, last error: %s", s, lastErr)
 	}
 	ac.acbw.updateState(s, lastErr)
+	// Wake up RPCs pinned to this subchannel that are blocked waiting for a
+	// state change, so they can re-check READY/Shutdown.
+	close(ac.stateCh)
+	ac.stateCh = make(chan struct{})
 }
 
 // adjustParams updates parameters used to create transports upon
@@ -1701,6 +1712,55 @@ func (ac *addrConn) getReadyTransport() transport.ClientTransport {
 		return ac.transport
 	}
 	return nil
+}
+
+// transportForPinnedCall returns a transport for an RPC whose subchannel
+// choice is pinned to this addrConn. Unlike a regular pick, it never selects
+// another subchannel, even when this one is not ready or receives a GoAway.
+//
+// The addrConn itself may transparently reconnect (e.g. after a GoAway), in
+// which case the returned transport is new but still belongs to the same
+// subchannel.
+//
+//   - If the subchannel is READY, its transport is returned immediately.
+//   - If the subchannel is SHUT_DOWN, an Unavailable error is returned; the
+//     subchannel will never become ready again, so wait-for-ready RPCs fail
+//     here as well instead of waiting forever.
+//   - In any other state, fail-fast RPCs fail with Unavailable and
+//     wait-for-ready RPCs block until THIS subchannel transitions state, the
+//     call context expires, or the ClientConn is closed.
+func (ac *addrConn) transportForPinnedCall(ctx context.Context, failFast bool) (transport.ClientTransport, error) {
+	for {
+		ac.mu.Lock()
+		switch {
+		case ac.state == connectivity.Ready && ac.transport != nil:
+			t := ac.transport
+			ac.mu.Unlock()
+			return t, nil
+		case ac.state == connectivity.Shutdown:
+			ac.mu.Unlock()
+			return nil, status.Error(codes.Unavailable, "grpc: the SubConn pinned by this RPC has been shut down")
+		}
+		ch := ac.stateCh
+		ac.mu.Unlock()
+
+		if failFast {
+			return nil, status.Error(codes.Unavailable, "grpc: the SubConn pinned by this RPC is not ready")
+		}
+		select {
+		case <-ctx.Done():
+			errStr := fmt.Sprintf("%v while waiting for the pinned SubConn to become ready", ctx.Err())
+			switch ctx.Err() {
+			case context.DeadlineExceeded:
+				return nil, status.Error(codes.DeadlineExceeded, errStr)
+			default:
+				return nil, status.Error(codes.Canceled, errStr)
+			}
+		case <-ac.cc.ctx.Done():
+			return nil, ErrClientConnClosing
+		case <-ch:
+		}
+	}
 }
 
 // tearDown starts to tear down the addrConn.

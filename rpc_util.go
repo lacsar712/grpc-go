@@ -181,6 +181,7 @@ type callInfo struct {
 	maxRetryRPCBufferSize       int
 	authority                   string
 	acceptedResponseCompressors []string
+	pinSubchannel               bool
 }
 
 func acceptedCompressorAllows(allowed []string, name string) bool {
@@ -364,6 +365,50 @@ func (o FailFastCallOption) before(c *callInfo) error {
 	return nil
 }
 func (o FailFastCallOption) after(*callInfo, *csAttempt) {}
+
+// PinSubchannel returns a CallOption that pins the RPC to the subchannel
+// selected for its first attempt.
+//
+// Once the first attempt has successfully selected a subchannel, every
+// subsequent attempt of the same RPC -- including regular retries,
+// transparent retries, and hedged attempts -- uses that same subchannel
+// instead of asking the load balancer's picker for another one. The retry
+// policy (number of attempts, backoff, and retryable status codes) is taken
+// from the service config and is not changed by this option.
+//
+// If the pinned subchannel is not ready, the RPC does not silently migrate to
+// another connection:
+//   - fail-fast RPCs fail with codes.Unavailable,
+//   - wait-for-ready RPCs keep waiting for this particular subchannel to
+//     become ready again.
+//
+// If the pinned subchannel is shut down (for example, because the load
+// balancer removed it), the RPC fails with codes.Unavailable.
+//
+// The binding is released when the RPC completes, fails, or is canceled, and
+// never applies to other RPCs. RPCs made without this option are unaffected.
+//
+// This option does not modify the method name, metadata, or compression of
+// the RPC.
+func PinSubchannel() CallOption {
+	return PinSubchannelCallOption{}
+}
+
+// PinSubchannelCallOption is a CallOption that pins all attempts of an RPC to
+// the subchannel selected by its first attempt.
+//
+// # Experimental
+//
+// Notice: This type is EXPERIMENTAL and may be changed or removed in a later
+// release.
+type PinSubchannelCallOption struct {
+	EmptyCallOption
+}
+
+func (o PinSubchannelCallOption) before(c *callInfo) error {
+	c.pinSubchannel = true
+	return nil
+}
 
 // OnFinish returns a CallOption that configures a callback to be called when
 // the call completes. The error passed to the callback is the status of the

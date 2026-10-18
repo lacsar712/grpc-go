@@ -456,6 +456,7 @@ func newClientStreamWithParams(ctx context.Context, desc *StreamDesc, cc *Client
 		cancel:              cancel,
 		firstAttempt:        true,
 		nameResolutionDelay: nameResolutionDelayed,
+		pinSubchannel:       callInfo.pinSubchannel,
 	}
 	if !cc.dopts.disableRetry {
 		cs.retryThrottler = cc.retryThrottler.Load().(*retryThrottler)
@@ -603,6 +604,9 @@ func (cs *clientStream) newAttemptLocked(isTransparent bool) (*csAttempt, error)
 
 func (a *csAttempt) getTransport() error {
 	cs := a.cs
+	if cs.pinSubchannel {
+		return a.getPinnedTransport()
+	}
 
 	pickInfo := balancer.PickInfo{Ctx: a.ctx, FullMethodName: cs.callHdr.Method}
 	pick, err := cs.cc.pickerWrapper.pick(a.ctx, cs.callInfo.failFast, pickInfo)
@@ -614,6 +618,77 @@ func (a *csAttempt) getTransport() error {
 		}
 		return err
 	}
+	if a.trInfo != nil {
+		a.trInfo.firstLine.SetRemoteAddr(a.transport.Peer().Addr)
+	}
+	if pick.blocked && a.statsHandler != nil {
+		a.statsHandler.HandleRPC(a.ctx, &stats.DelayedPickComplete{})
+	}
+	return nil
+}
+
+// getPinnedTransport handles subchannel selection for an RPC started with the
+// PinSubchannel CallOption. The first attempt picks normally and records the
+// selected addrConn; every later attempt (retry, transparent retry, hedged
+// attempt) reuses it instead of asking the picker again. pinMu serializes
+// establishment so concurrent (hedged) attempts all bind to the subchannel of
+// the first successful pick.
+func (a *csAttempt) getPinnedTransport() error {
+	cs := a.cs
+	cs.pinMu.Lock()
+	defer cs.pinMu.Unlock()
+
+	if ac := cs.pinnedAC; ac != nil {
+		// Binding is established: use this subchannel's current ready
+		// transport, and never pick another one.
+		t, err := ac.transportForPinnedCall(a.ctx, cs.callInfo.failFast)
+		if err != nil {
+			return err
+		}
+		pr := balancer.PickResult{SubConn: ac.acbw, Metadata: cs.pinnedMetadata}
+		// The load balancer is not consulted for this attempt, so mirror the
+		// per-attempt channelz accounting the picker wrapper normally adds
+		// around the pick result's Done callback.
+		if channelz.IsOn() {
+			ac.incrCallsStarted()
+			pr.Done = func(b balancer.DoneInfo) {
+				if b.Err != nil && b.Err != io.EOF {
+					ac.incrCallsFailed()
+				} else {
+					ac.incrCallsSucceeded()
+				}
+			}
+		}
+		a.transport = t
+		a.pickResult = pr
+		if a.trInfo != nil {
+			a.trInfo.firstLine.SetRemoteAddr(t.Peer().Addr)
+		}
+		return nil
+	}
+
+	// First attempt: use the picker exactly like a non-pinned RPC. The
+	// binding is created only on a successful pick, so a failed first pick
+	// (or a drop) leaves no binding behind.
+	pickInfo := balancer.PickInfo{Ctx: a.ctx, FullMethodName: cs.callHdr.Method}
+	pick, err := cs.cc.pickerWrapper.pick(a.ctx, cs.callInfo.failFast, pickInfo)
+	if err != nil {
+		if de, ok := err.(dropError); ok {
+			err = de.error
+			a.drop = true
+		}
+		return err
+	}
+	acbw, ok := pick.result.SubConn.(*acBalancerWrapper)
+	if !ok {
+		// The picker wrapper already performs this type assertion, so this
+		// is purely defensive.
+		logger.Errorf("subconn returned from pick is type %T, not *acBalancerWrapper", pick.result.SubConn)
+		return status.Error(codes.Internal, "grpc: pick returned an invalid SubConn type")
+	}
+	cs.pinnedAC = acbw.ac
+	cs.pinnedMetadata = pick.result.Metadata
+	a.transport, a.pickResult = pick.transport, pick.result
 	if a.trInfo != nil {
 		a.trInfo.firstLine.SetRemoteAddr(a.transport.Peer().Addr)
 	}
@@ -722,6 +797,22 @@ type clientStream struct {
 	stopStreamWatcher func() bool // stops the callback registered to run on RPC context expiration
 	stopConnWatcher   func() bool // stops the callback registered to run on ClientConn context expiration
 
+	// pinMu guards pinnedAC and pinnedMetadata. It is a dedicated mutex
+	// (instead of mu) because the first pinned pick may block while holding
+	// it, e.g. for wait-for-ready. It also serializes establishment of the
+	// binding between concurrent attempts, so that every attempt of a call
+	// (including parallel hedged attempts) observes the same subchannel.
+	pinMu sync.Mutex
+	// pinnedAC is the addrConn chosen by the call's first successful pick
+	// when the call was started with PinSubchannel. nil until the first
+	// attempt has successfully selected a subchannel, and nil again after
+	// the call releases the binding in finish.
+	pinnedAC *addrConn
+	// pinnedMetadata is the metadata returned alongside the first pick (for
+	// example, an :authority override), re-applied to later attempts that
+	// reuse the pinned subchannel.
+	pinnedMetadata metadata.MD
+
 	// Bool fields are grouped at the tail to eliminate the alignment padding
 	// that would otherwise follow each bool when the next field is pointer- or
 	// int-sized. See https://github.com/grpc/grpc-go/issues/9280 for benchmarks.
@@ -745,6 +836,9 @@ type clientStream struct {
 	firstAttempt bool // if true, transparent retry is valid
 	finished     bool // TODO: replace with atomic cmpxchg or sync.Once?
 	committed    bool // active attempt committed for retry?
+
+	// Not guarded; set once from the call options before the first attempt.
+	pinSubchannel bool // PinSubchannel CallOption was set for this call
 }
 
 type replayOp struct {
@@ -805,6 +899,18 @@ func (cs *clientStream) commitAttempt() {
 	cs.mu.Lock()
 	cs.commitAttemptLocked()
 	cs.mu.Unlock()
+}
+
+// releasePinnedSubConnLocked releases the binding established by the
+// PinSubchannel CallOption. The caller must hold cs.mu.
+func (cs *clientStream) releasePinnedSubConnLocked() {
+	if !cs.pinSubchannel {
+		return
+	}
+	cs.pinMu.Lock()
+	cs.pinnedAC = nil
+	cs.pinnedMetadata = nil
+	cs.pinMu.Unlock()
 }
 
 // shouldRetry returns nil if the RPC should be retried; otherwise it returns
@@ -1210,6 +1316,10 @@ func (cs *clientStream) finish(err error) {
 	if cs.stopConnWatcher != nil {
 		cs.stopConnWatcher()
 	}
+	// Release the subchannel binding, if any. Later, unrelated RPCs must pick
+	// their subchannels normally. Any blocked pinned attempt is unblocked by
+	// the context cancellation, which finish triggers via cs.cancel().
+	cs.releasePinnedSubConnLocked()
 	cs.commitAttemptLocked()
 	attemptCreated := cs.attempt != nil
 	if attemptCreated {
